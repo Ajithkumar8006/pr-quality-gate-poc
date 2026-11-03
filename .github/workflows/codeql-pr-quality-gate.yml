@@ -1,0 +1,114 @@
+name: CodeQL PR Quality Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+  workflow_dispatch:
+    inputs:
+      unclassified_policy:
+        description: How to handle findings without valid security-severity metadata
+        required: true
+        type: choice
+        options:
+          - fail
+          - pass
+        default: fail
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-pr-quality-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: Build, test, and CodeQL security gate
+    runs-on: ubuntu-latest
+    env:
+      CODEQL_UNCLASSIFIED_POLICY: ${{ inputs.unclassified_policy || 'fail' }}
+      CODEQL_SUMMARY_FILE: ${{ runner.temp }}/codeql-quality-gate-summary.md
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java
+          build-mode: manual
+
+      - name: Build application
+        id: build
+        run: mvn -B --no-transfer-progress clean package -DskipTests
+
+      - name: Run unit tests
+        id: unit-tests
+        run: mvn -B --no-transfer-progress test
+
+      - name: Analyze with CodeQL and write SARIF
+        id: codeql-analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:java
+          output: ${{ runner.temp }}/codeql-results
+
+      - name: Evaluate SARIF security quality gate
+        id: evaluate
+        if: always() && steps.codeql-analysis.outcome == 'success'
+        env:
+          SARIF_REPORT: ${{ runner.temp }}/codeql-results
+        run: python3 tools/codeql_sarif_gate.py "$SARIF_REPORT" "$CODEQL_SUMMARY_FILE"
+
+      - name: Publish job summary
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          TEST_OUTCOME: ${{ steps.unit-tests.outcome }}
+          CODEQL_OUTCOME: ${{ steps.codeql-analysis.outcome }}
+          GATE_OUTCOME: ${{ steps.evaluate.outcome }}
+        run: |
+          status_label() {
+            case "$1" in
+              success) printf 'PASSED' ;;
+              failure) printf 'FAILED' ;;
+              cancelled) printf 'CANCELLED' ;;
+              skipped) printf 'SKIPPED' ;;
+              *) printf 'NOT RUN' ;;
+            esac
+          }
+
+          if [[ -f "$CODEQL_SUMMARY_FILE" ]]; then
+            cat "$CODEQL_SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              printf '# CODEQL SECURITY QUALITY GATE\n\n'
+              printf 'Finding counts: not available because SARIF evaluation did not run.\n\n'
+              printf 'Quality Gate: **NOT EVALUATED**\n\n'
+              printf 'Reason: CodeQL analysis did not complete successfully.\n\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            printf '## Validation Status\n\n'
+            printf '| Check | Status |\n| --- | --- |\n'
+            printf '| Build | %s |\n' "$(status_label "$BUILD_OUTCOME")"
+            printf '| Unit tests | %s |\n' "$(status_label "$TEST_OUTCOME")"
+            printf '| CodeQL scan | %s |\n' "$(status_label "$CODEQL_OUTCOME")"
+            printf '| Quality gate evaluation | %s |\n' "$(status_label "$GATE_OUTCOME")"
+          } >> "$GITHUB_STEP_SUMMARY"
